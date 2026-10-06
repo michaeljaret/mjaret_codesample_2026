@@ -85,7 +85,7 @@ cont_coeffs <- function(model, trans, parameter, vcov, horizons, lags = NULL, le
 cont_output <- function(model, trans, parameter, vcov, label) {
   #extract coefficients of the model to a data frame using a function to simplify plotting
   trans[[1]] <- if_else(trans[1] == "asinh", "asinh_", trans[1])
-  variable <- paste0(trans[1], "_cont_", trans[2], "_", parameter)
+  variable <- paste0(trans[1], "cont_", trans[2], "_", parameter)
   coeffs_df <- as.data.frame(summary(model, vcov = vcov)$coeftable)
   coeffs_df$name <- rownames(coeffs_df)
   coeffs_df %>%
@@ -100,8 +100,8 @@ cont_output <- function(model, trans, parameter, vcov, label) {
                #lead terms to -11 to -2 (left side of graph)
                grepl("f\\(", name) ~ -as.numeric(sub(".*, (\\d+)\\)", "\\1", name)),
                #binned endpoints to -12 and 12
-               name == paste0("lead_", variable, "_end") ~ -12,
-               name == paste0("lag_", variable, "_end") ~ 12),
+               name == paste0("lead_", variable, "_end_12") ~ -12,
+               name == paste0("lag_", variable, "_end_12") ~ 12),
            Model = label) %>%
     rename(SE = 'Std. Error')
   }
@@ -110,6 +110,7 @@ cont_output <- function(model, trans, parameter, vcov, label) {
 main_cont_model <- feols(cont_model("price_log", c("asinh", "log"), "0001", 1:11, 2:11, TRUE, c("temp", "ppt", "pdsi"), c("CITY", "month_year")), data = panel_all)
 #print cumulative lag and cumulative lead coefficient estimates for the continuous exposure model
 cont_coeffs(main_cont_model, c("asinh", "log"), "0001", countyyear_cluster_vcov(main_cont_model), c("l", "f"), lags = 1:11, leads = 2:11)
+main_cont_output <- cont_output(main_cont_model, c("asinh", "log"), "0001", countyyear_cluster_vcov(main_cont_model), "Main Continuous Model")
 
 #check robustness with other specifications:
 #run model with no endpoint binning

@@ -90,7 +90,7 @@ main_cont_plot <- ggplot(data = main_cont_output, aes(x = horizon, y = Estimate)
   geom_hline(yintercept = 0, linetype = "dashed", color = "black", alpha = 0.3) + 
   geom_vline(xintercept = 0, color = "red", alpha = 0.1, linewidth = 5) +
   geom_pointrange(aes(ymin = Estimate - 1.96*SE, ymax = Estimate + 1.96*SE)) + 
-  scale_x_continuous(breaks = seq(-12, 12, 2)) + 
+  scale_x_continuous(breaks = seq(-12, 12, 2), limits = c(-12.1, 12.1)) + 
   labs(x = "Exposure Horizon", y = "Coefficient Estimate") +
   theme_minimal() +
   theme(panel.background = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line())
