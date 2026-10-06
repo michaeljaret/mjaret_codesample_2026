@@ -50,14 +50,14 @@ calfire_frap <- read_sf((here("raw_data", "fire25_1.gdb")), layer = "firep25_1")
 fires_clean <- calfire_frap %>%
   mutate(start_date = as.Date(ALARM_DATE), end_date = as.Date(CONT_DATE)) %>%
   #choose 'GlobalID' as a unique fire identifier and rename as 'FIRE' for simplicity
-  rename(FIRE = GlobalID) %>%
+  rename(FIRE = GlobalID, magnitude = GIS_ACRES) %>%
   filter(
     #remove fires where dates are missing or start date is past end date
     !(is.na(start_date)|is.na(end_date)), 
     !start_date > end_date, 
     #remove fires not active between January 2000 and December 2025
     !(end_date < as.Date("2000-01-01")|start_date > as.Date("2025-12-31"))) %>%
-  select(FIRE, GIS_ACRES, start_date, end_date, Shape) %>% 
+  select(FIRE, magnitude, start_date, end_date, Shape) %>% 
   mutate(start_month = as.Date(paste0(year(start_date), "-", month(start_date), "-01")), 
          end_month = as.Date(paste0(year(end_date), "-", month(end_date), "-01"))) %>% 
   #transform curved lines into multi-polygons to enable computation
@@ -128,53 +128,75 @@ fires_clean <- fires_clean %>%
   mutate(month_year = list(seq(start_month, end_month, by = "month"))) %>%
   unnest(month_year) %>%
   ungroup()
-#calculate magnitude and duration as part of the continuous exposure measure
+#calculate magnitude as part of the continuous exposure measure
 fires_summary <- fires_clean %>%
-  #for each month find: 1) days in month, and 2) the days the fire was active per month
-  mutate(days_month = days_in_month(month_year),
-         #determine whether the month or the fire ended first
-         month_ceiling = as.Date(pmin(ceiling_date(month_year, unit = "month") - days(1), end_date)),
-         #determine whether the month or the fire started first
-         month_floor = as.Date(pmax(floor_date(month_year, unit = "month"), start_date)),
-         #calculate the number of days between the two values
-         days_active = as.numeric(month_ceiling - month_floor) + 1,
-         #calculate the ratio of the days the fire was active in the month and the total number of days in the month
-         duration = days_active/days_month,
-         #calculate magnitude using a log transformation
-         magnitude = log1p(GIS_ACRES)) %>% 
-  select(FIRE, month_year, start_date, end_date, magnitude, duration, Shape)
+  #for each month find: 1) days the fire was active, and 2) the share of the month the fire was active
+  mutate(
+    #log-transform magnitude
+    log_magnitude = log1p(magnitude),
+    #determine whether the month or the fire ended first
+    month_ceiling = as.Date(pmin(ceiling_date(month_year, unit = "month") - days(1), end_date)),
+    #determine whether the month or the fire started first
+    month_floor = as.Date(pmax(floor_date(month_year, unit = "month"), start_date)),
+    #calculate the number of days the fire is active in the month
+    fire_month = as.numeric(month_ceiling - month_floor) + 1,
+    #calculate the ratio of the days the fire was active in the month and the total number of days in the month
+    days_in_month = as.numeric(ceiling_date(month_year, unit = "month") - floor_date(month_year, unit = "month")) - 1,
+    #find the share of the month the fire was active
+    monthly_share = fire_month/days_in_month,
+    #incorporate monthly share into exposure
+    across(contains("magnitude"), ~ .x * monthly_share, .names = "monthly_{.col}")) %>%
+  select(FIRE, month_year, start_date, end_date, monthly_magnitude, monthly_log_magnitude, Shape)
 #join fire characteristics (duration, magnitude) with city-fire pairs and expand for each active month
-exposure <- inner_join(cityfire_pairs, fires_summary %>% st_drop_geometry(), by = "FIRE", relationship = "many-to-many") %>%
+fires_cities <- inner_join(cityfire_pairs, fires_summary %>% st_drop_geometry(), by = "FIRE", relationship = "many-to-many") %>%
   filter(CITY %in% cities)
 
-#construct continuous exposure measure
-cont_exp_panel <- exposure %>%
-  #calculate exposure by row
+#construct continuous exposure panel with raw magnitude (and then log-transformed magnitude)
+cont_raw_panel <- fires_cities %>%
+  #calculate exposure (magnitude*exp(-theta*distance)) by row
   rowwise() %>%
-  mutate(cont = list(map_dbl(theta, ~ magnitude*duration*exp(-.x*distance)))) %>%
+  mutate(cont_raw = list(map_dbl(theta, ~ monthly_magnitude*exp(-.x*distance)))) %>%
   ungroup() %>%
-  unnest_wider(cont, names_sep = "_") %>%
+  unnest_wider(cont_raw, names_sep = "_") %>%
   group_by(CITY, month_year) %>%
-  #combine into city-months observations and sum
+  #combine into city-months observations and summarize by summing across each month
   summarise(across(starts_with("cont_"), sum)) %>%
   ungroup() %>%
   #employ inverse hyperbolic sine (asinh) transformation on columns
   mutate(across(starts_with("cont_"), asinh, .names = "asinh_{.col}")) %>%
   #fill city-months with no exposure with zeroes
-  complete(CITY = cities, month_year = period, 
-           fill = list(cont_0004 = 0, cont_0002 = 0, cont_0001 = 0, cont_00005 = 0, cont_000025 = 0,
-                       asinh_cont_0004 = 0, asinh_cont_0002 = 0, asinh_cont_0001 = 0, asinh_cont_00005 = 0, asinh_cont_000025 = 0)
-  ) %>%
+  complete(CITY = cities, month_year = period) %>% 
+  mutate(across(everything(), ~ replace_na(., 0))) %>%
   arrange(CITY, month_year)
 
+#construct continuous exposure panel with log-transformed magnitude
+cont_log_panel <- fires_cities %>%
+  #calculate exposure (magnitude*exp(-theta*distance)) by row
+  rowwise() %>%
+  mutate(cont_log = list(map_dbl(theta, ~ monthly_log_magnitude*exp(-.x*distance)))) %>%
+  ungroup() %>%
+  unnest_wider(cont_log, names_sep = "_") %>%
+  group_by(CITY, month_year) %>%
+  #combine into city-months observations and summarize by summing across each month
+  summarise(across(starts_with("cont_"), sum)) %>%
+  ungroup() %>%
+  #employ inverse hyperbolic sine (asinh) transformation on columns
+  mutate(across(starts_with("cont_"), asinh, .names = "asinh_{.col}")) %>%
+  #fill city-months with no exposure with zeroes
+  complete(CITY = cities, month_year = period) %>% 
+  mutate(across(everything(), ~ replace_na(., 0))) %>%
+  arrange(CITY, month_year)
+#combine into continuous exposure panel. The panel contains the 20 permutations around the variable: 5 parameters, 2 log/raw magnitude, 2 asinh/normal exposure
+continuous_panel <- left_join(cont_raw_panel, cont_log_panel, by = c("CITY", "month_year"))
+
 #calculate binary binned exposure variable
-binary_exp_panel <- exposure %>%
+binary_panel <- fires_cities %>%
   filter(distance <= 100000) %>%
-  mutate(binary_0_10 = ifelse(distance >= 0 & distance <= 10000, 1, 0),
+  mutate(binary_0_10 = ifelse(distance <= 10000, 1, 0),
          binary_10_50 = ifelse(distance > 10000 & distance <= 50000, 1, 0),
          binary_50_100 = ifelse(distance > 50000 & distance <= 100000, 1, 0)) %>%
   group_by(CITY, month_year) %>%
-  #combine into city-month observations (summarize with 1 showing at least one fire was active in the bin in the month)
+  #combine into city-month observations with 1 showing at least one fire was active in the bin in the month and 0 otherwise
   summarise(across(starts_with("binary_"), ~ as.integer(sum(.x) > 0))) %>%
   ungroup() %>%
   select(CITY, month_year, binary_0_10, binary_10_50, binary_50_100) %>%
@@ -183,40 +205,34 @@ binary_exp_panel <- exposure %>%
   arrange(CITY, month_year)
 
 #calculate days binned exposure variable
-days_exp_panel <- exposure %>%
+days_panel <- fires_cities %>%
   filter(distance <= 100000) %>%
-  select(-magnitude, -duration, -FIRE) %>%
-  #for each month, create variables defining the beginning and end of each month
-  mutate(start_month = floor_date(month_year, unit = "month"),
-         end_month = ceiling_date(month_year, unit = "month") - days(1)) %>%
+  select(-monthly_magnitude, -monthly_log_magnitude, -FIRE, -month_year) %>%
   rowwise() %>%
   #for each month, expand data set to show each day
-  mutate(days_active = list(seq(start_month, end_month, by = "day"))) %>%
-  unnest(days_active) %>%
+  mutate(days_fire = list(seq(start_date, end_date, by = "day"))) %>%
+  unnest(days_fire) %>%
   ungroup() %>%
   #define bins with 1 showing the fire was active that day, and 0 otherwise
   mutate(
-    active = ifelse(days_active >= start_date & days_active <= end_date, 1, 0),
-    days_0_10 = ifelse(distance >= 0 & distance <= 10000, active, 0),
-    days_10_50 = ifelse(distance > 10000 & distance <= 50000, active, 0),
-    days_50_100 = ifelse(distance > 50000 & distance <= 100000, active, 0)) %>%
+    days_0_10 = ifelse(distance >= 0 & distance <= 10000, 1, 0),
+    days_10_50 = ifelse(distance > 10000 & distance <= 50000, 1, 0),
+    days_50_100 = ifelse(distance > 50000 & distance <= 100000, 1, 0)) %>%
   #group by day, with 1 showing at least one fire was active in that bin for the day
-  group_by(CITY, days_active) %>%
+  group_by(CITY, days_fire) %>%
   summarise(
     days_0_10 = as.integer(sum(days_0_10) > 0),
     days_10_50 = as.integer(sum(days_10_50) > 0),
     days_50_100 = as.integer(sum(days_50_100) > 0),
-    .groups = "drop"
-  ) %>% ungroup() %>%
-  mutate(month_year = floor_date(days_active, "month")) %>%
+    .groups = "drop") %>%
+  mutate(month_year = floor_date(days_fire, unit = "months")) %>%
   #sum to find the number of days with fire activity for that month
   group_by(CITY, month_year) %>%
   summarise(
     days_0_10 = sum(days_0_10),
     days_10_50 = sum(days_10_50),
     days_50_100 = sum(days_50_100),
-    .groups = "drop"
-  ) %>%
+    .groups = "drop") %>%
   ungroup() %>%
   #complete the data set for all cities and months
   filter(CITY %in% cities, month_year %in% period) %>%
@@ -244,7 +260,7 @@ length(unique(city_pwc_ll$CITY_short))
 #remove header to support PRISM requirements
 names(city_pwc_ll) <- NULL
 #create .csv file to upload into PRISM
-write.csv(city_pwc_ll, here("source_data", "prism_cities_ll.csv"), row.names = FALSE)
+write.csv(city_pwc_ll, here("intermediate_data", "prism_cities_ll.csv"), row.names = FALSE)
 #extract data from https://prism.oregonstate.edu/explorer/bulk.php, which permits 15 years per download
 weather_00_14 <- read.csv(here("raw_data", "PRISM_ppt_tmean_stable_800m_200001_201412.csv"))
 weather_15_25 <- read.csv(here("raw_data", "PRISM_ppt_tmean_stable_800m_201501_202512.csv"))
@@ -287,14 +303,17 @@ weather_panel <- bind_rows(weather_00_14, weather_15_25) %>%
   select(CITY, month_year, ppt, temp) %>%
   filter(CITY %in% cities, month_year %in% period) %>%
   arrange(CITY, month_year)
+#load PDSI data
+pdsi_panel <- readRDS(here("intermediate_data", "pdsi_panel.rds"))
 
 #combine all panels into large panel for regressions
-panel_all <- left_join(zhvi_panel, cont_exp_panel, by = c("CITY", "month_year")) %>% 
-  left_join(binary_exp_panel, by = c("CITY", "month_year")) %>%
-  left_join(days_exp_panel, by = c("CITY", "month_year")) %>%
+panel_all <- left_join(zhvi_panel, continuous_panel, by = c("CITY", "month_year")) %>% 
+  left_join(binary_panel, by = c("CITY", "month_year")) %>%
+  left_join(days_panel, by = c("CITY", "month_year")) %>%
   left_join(weather_panel, by = c("CITY", "month_year")) %>%
+  left_join(pdsi_panel, by = c("CITY", "month_year")) %>%
   left_join(calfire_cities %>% 
-              #add county and year clustered standard errors specification (Cameron and Miller, 2015)
+              #add county and year for clustered standard errors specification (Cameron and Miller, 2015)
               select(CITY, COUNTY) %>% 
               st_drop_geometry(), by = "CITY") %>%
   mutate(year = year(month_year)) %>%
@@ -306,4 +325,4 @@ panel_all <- left_join(zhvi_panel, cont_exp_panel, by = c("CITY", "month_year"))
               st_drop_geometry() %>% 
               select(CITY, lat, lon), by = "CITY")
 
-saveRDS(panel_all, here("source_data", "panel_all.rds"))
+saveRDS(panel_all, here("intermediate_data", "panel_all.rds"))
